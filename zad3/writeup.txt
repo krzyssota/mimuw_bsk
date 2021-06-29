@@ -1,0 +1,85 @@
+Na początku myślałem, że wyexploitować trzeba fgets i bufor - (nie)stety są one raczej bezpieczne.
+Potem pomyślałem od wykorzystaniu funkcji strtod. Znalazłem:
+https://vigilance.fr/vulnerability/glibc-integer-overflow-of-strtod-11841
+"However, for example, if the size of the string to convert is larger than 200kbytes (10.....0e3),
+then an integer overflow occurs in the stdlib/strtod_l.c file. An attacker can thus generate several
+overflows in the dig_no, int_no and lead_zero variables."
+Niestety nie jesteśmy w stanie jej podać 200kB danych.
+
+Chyba jednak trzeba szukać błędów w samym programie a nie funkcjach biblioteczych.
+Najważniejszą obserwacją jest, że stosy mają rozmiary 32 enumy/double, a wartość wskaźnika stosu w żadnym miejscu nie jest sprawdzana.
+Łatwo można to wykorzystać do przepełnienia buforu.
+Obejrzeć bufor było najłatwiej w GDB funkcją print (void *) stack_value[i].
+Można było wtedy dowiedzieć się, że kanarek jest na stack_value[33], adres powrotu do funkcji main
+na stack_value[35] (ramka compute), a adres powrotu do funkcji __libc_start_main na stack_value[39] (ramka main).
+
+Wyciągnięcie kanarka jest stosunkowo proste.
+    'c=' + '(' * 33 + ')' * 32
+Mimo, że każda operacja podbija sp to tylko nawiasy pozwalają nam na sciągnięcie
+wartości (której nie odpowiada TOKEN_VAL w stack_token[]) w dół stosu. Serią '(' i ')' dojeżdżamy do kanarka by następnie
+sciągnąć go w dół stosu (stack_value[sp-2] = stack_value[sp-1]) i zapisać go na zmiennej (vars[to_var] = stack_value[sp-1]).
+
+Po użyciu narzędzia online do znalezienia gadżetu 'pop rdi; ret' w binarce chciałem poznać adres powrotu do funkcji main.
+    "m=" + '(' * 35 + ')'*34    +    '+(c-' + '(' * 27 + 'c' + ')' * 28
+Sposób wyciągnięcia wartości analogiczny jak dla kanarka działa - tylko niestety wracając w dół stosu nadpisujemy go
+i program kończy się z błędem.
+Sposobem na to jest późniejsze go naprawienie - dodajemy sekwencje +(c-(...(c)...). Arytmetycznie nie zmienia nam to wartości adresu main
+(m = main_addr +(c-(c)) = main_addr + 0), ale nawiasami dojeżdżamy do stack_value[33], nadpisujemy go poprawnym kanarkiem
+i zjeżdżamy z powrotem na dół.
+
+Do wyciągnięcia adresu libc taka sztuczka musiałaby naprawiać dwie wartości (kanarka i adres powrotu main).
+Łatwiej jest ochronić adres powrotu a potem naprawić kanarka starym sposobem.
+    'l=' + '(' * 33 + '0+' + '('*4 + ')' * 36    +    '+(c-' + '(' * 27 + 'c' + ')' * 28
+Robimy to przysłaniając go i jego poprzednika "0+". Kiedy będziemy jechać w dół stosu przeskoczymy to miejsce napotykając
+TOKEN_VAL TOKEN_ADD TOKEN_VAL (zauważmy, że ')' przepisując wartość w dół nakłada TOKEN_VAL na stack_token)
+i przejdziemy nad adresem powrotu nie nadpisując go
+    stack_value[sp-3] += stack_value[sp-1]; sp -= 2; gdzie sp-2 to indeks adresu
+
+Skoro znamy już adresy randomizowane i ochrone stosu to należy się zastanowić jak obliczać prawdziwe interesujące nas
+adresy w programie calc - nie możemy tego liczyć w skrypcie, bo w trybie --hard możemy tylko raz coś wypisać na stdout.
+Wrzucenie hexów tak po prostu nie działa - są one rzędu paru tysięcy, więc nie da dodawać się ich z adresami libc
+czy binarki które są rzędu e-320 a więc prawie 0.
+Trzeba przetłumaczyć je na double i w takiej postaci wlozyć do pamięci calc. Skorzystałem do tego ze znalezionej
+na githubie (https://github.com/olearczuk/MIMUW-BSK/tree/master/Pwn/)
+studenta mimuw funkcji
+def to_double_str(i):
+    return str(struct.unpack('>d', bytes.fromhex(i[2:].zfill(16)))[0])
+
+Łatwo sprawdzić (policzyć jednocześnie w calc i w skrypcie pythonowym), że arytmetyka adresów z takimi offsetami działa.
+Teraz pozostaje włożyć na stack_value[35] [36] [37] odpowiednio 'pop rdi; ret', "/bin/sh" i adres funkcji system.
+Można to zrobić na trzy razy, za każdym razem osłaniając wartość kanarka i dwa razy adres powrotu
+działaniami z ich elementami neutralnymi. Kanarka osłaniamy "0+", a  adres powrotu "1*", korzystająć przy tym
+z kolejności wykonywania działań (w odwrotnej kolejności nie zadziałoby to).
+
+Po wysłaniu ostatniej sekwencji funkcja compute skoczy do adresu 'pop rdi; ret', włoży "/bin/sh" do rdi
+i wywoła funkcje system z tym argumentem.
+
+
+Po drodze oczywiście pojawiały się inne pomysły. To niektóre z nich:
+
+1) Może uda się dojechać do kanarka i wykorzystać jego zerowe bajty do oszukania stack_token[sp-2] == TOKEN_START
+przed wypisaniem wartości. Gdyby były 4 bajty zerowe to chyba by zadziałało.
+
+2) Na zajęciach pokazane były dwa sposoby na wycieknięcie adresu libc. Na początku chciałem wykorzystać:
+0000000000001060 <printf@plt>:
+    1060:       ff 25 ca 2f 00 00       jmpq   *0x2fca(%rip)        # 4030 <printf@GLIBC_2.2.5>
+    1066:       68 03 00 00 00          pushq  $0x3
+    106b:       e9 b0 ff ff ff          jmpq   1020 <.plt>
+
+a więc następującą sekwencję na stack_value[35,36,37] =
+0x4030 # got_printf
+0x1060 # print
+0x1c73 # pop rdi; ret
+ale łatwiej bylo po prostu sięgnąć do ramki maina (całe szczęście nia miała ona za dużo rzeczy na stosie).
+
+3) Kiedy nie udało mi się naprawiać kanarka szukalem sposobu, żeby zakończyć funkcje compute bez błędu oszukując wspomniany
+już warunek (stack_token[sp-2] != TOKEN_START).
+Potrzeba było, żeby
+stack_token[sp-2] != TOKEN_START i stack_token[sp-1] miał interesującą mnie wartość.
+    (gdb) print (void *) stack_token[32]
+        $19 = (void *) 0x0
+    (gdb) print (void *) stack_token[38]
+        $13 = (void *) 0x0
+Te dwa miejsca były obiecujące (odpowiednio dla adres powrotu do maina i do libc), ale niestety
+stack_token[32] (połowa stack_value[1]) jest wtedy nadpisywane przez TOKEN_LP a to właśnie tam zapisana jest wartość,
+którą chce poznać.

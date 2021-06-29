@@ -1,0 +1,212 @@
+Do rozwiązania zadania używałem Ghidry, Gdb i demo wersji Idy (pod koniec pracy skonczyła mi się pula darmowych dekompilacji :) ).
+Pierwsza obserwacja dotyczyła linijek
+    memset(&i1, 0, 0x128uLL);
+    fread(&i1, 0x128uLL, 1uLL, stream)
+dla zmiennych kolejno zadelkarowanych zmiennych
+  	int i1;
+  	uint ui1;
+  	char c_256 [256];
+  	undefined un_39 [39];
+
+memset zeruje 296 bajtów od poczatku pamieci zajmowanej przez i1. Znaczy to, że fread chce tak naprawde zczytywać zawartość pliku do bufora wielkości 296 bajtów.
+Co się mieści w tym buforze? char[256] od razu przywodzi na myśl maksymalną długość nazwy pliku w UNIXie. i1 porównywane jest potem z dwoma liczbami, by określić poziom trudności szyfrowania. Wypisując kolejne bajty z tego bufora dla hello.enc zauważyłem, że jest tam 0xe == len('Hello World!'). Dodatkowo ta zmienna używana jest potem w pętli mniej więcej takiej:
+	while(v1 < ui1) {
+		read(&v2, 4uLL, 1uLL, stream);
+		v1 += 4
+	}
+Wtedy już można mieć pewność, że ui1 odnosi się do długości pliku.
+Ostatnia tablica (tak naprawdę długości 32 bo 4+4+256+32=296) porównywana jest z przekopiowanymi i potencjalnie zmodyfikowanymi kawałkami hasła:
+	memcmp(un_39,__s2,0x20);
+zawiera, więc zmodyfikowana część hasła.
+
+Wiemy, więc że bufor jest tak naprawdę pewną stukturą przechowująca dane o deszyfrowanym pliku.
+	struct {
+    	char hardness_level[4];
+    	uint size;
+    	char name [256];
+    	char cyphered_key[32];
+	}
+To, że trudność może być zinterpretowana jako char[4] odkryłem przeklikując w idzie formaty wszystkich stałych w kodzie w poszukiwani "2137" (hex, dec, char itd.).
+
+Następną kwestią była pętla:
+
+	puVar3 = (undefined4 *)0x103254;
+	out_fun_address = out_fun;
+	do {
+	    uVar1 = *(undefined4 *)out_fun_address;
+	    out_fun_address = (code *)((long)out_fun_address + 4);
+	    uVar1 = sub_1000(uVar1);
+	    *(undefined4 *)((long)out_fun_address + -4) = uVar1;
+	} while ((undefined4 *)out_fun_address != puVar3);
+
+, która tak naprawdę znaczy mniej więcej:
+/*
+	b = 0x1030b0;
+    do {
+        b = sub_1000(b)
+        b += 4
+    } while (b != 0x103254) */
+
+gdzie funkcja sub_1000 modyfikuje wartość argumentu b.
+Oznacza to, że pętla zmienia kod programu decrypt na 420 adresach od 0x1030b0 do 0x103254 (adresy ghidrowe, nie prawdziwe).
+Na tych adresach zapisane są dziwne funkcja (z instrukcją out, lub funkcja od razu returnująca), więc wiemy, że trzeba przekopiować bajty po zmodyfikowaniu kodu do naszego programu, analogicznie jak to robiliśmy na zajęciach drugich, by uzyskać sensowny kod.
+Mianowicie trzeba postawić breakpoint w gdb zaraz za pętlą i wykonać instrukcje dump memory plik.bin na adresach 0x5555555570b0 0x555555557254.
+Potem trzeba wkleić te bajty do naszego programu (np. w pythonie), sprawdzając wcześniej byte source offset (=0x20b0) adresu 1030b0 w ghidrze
+
+	with open('decrypt', 'rb') as f: d = f.read()
+	with open('plik.bin', 'rb') as f: d2 = f.read()
+	d = bytearray(d)
+	d[0x20b0 : 0x20b0+len(d2)] = d2
+	with open('decrypt_modified', 'wb') as f: f.write(d)
+
+Dostajemy wtedy binarke decrypt_modified, która z powrotem dekompilujemy i widzimy, że na wspomnianych adresach mamy nowe (sensowne) funkcje.
+W tym momencie zacząłem już pisać własny program. Wykomentowałem oczywiście pętlę zmieniająca kod (już był zmieniony) trzeba było jednak podstawić pod zmienne globalne (u mnie, w binarce to adresy pamieci) odpowiednie wartości ustawiane w czasie trwania pętli.
+Funkcja sub_1000 modyfikuje wartości 4 zmiennych qword_30A0, qword_30A4, qword_30A8, qword_30AC. Są to główne zmienne służace do odkodowywania pliku.
+pierwsze 2 i tak zostają zastąpione przez odpowiednio getpid i getppid, a wartości kolejnych dwóch wziałem z gdb: x/u 0x5555555570a8, x/u 0x5555555570ac.
+
+Następnie trzeba było poprawnie przepisać funkcje sub_3100. Wywołuje ona funkcje sub_FC0 na kolejnych kawałkach nazwy pliku. Jakie są to kawałki najlepiej się przekonać patrząc w assembler:
+		MOV		RDI, dword ptr [file_name]
+		ADD 	file_name, 0x4
+		CALL	sub_FC0
+gdzie funkcja FCO dostaje argument w rejestrze EDI.
+W takim razię pętla ta bierze za każdym razem po 4 bajty nazwy pliku.
+Reszta funkcji, może zostać przepisana raczej bez zmian (pobieranie pidów chyba miało tylko utrudnić debugging a nie służy do dekodowania pliku, ale zostawiłem te fragmenty kodu i tak).
+
+Potem w kodzie maina następuje seria scanfów. Ważna obserwacją tutaj jest, że 3. 4. i 6. scanf nadpisują fragmenty kodu funkcji sub_30B0. A więc teraz jest ona nie do końca poprawna. Moglibyśmy chyba to naprawić kolejnych memory dumpem, ale można to zrobić łatwiej. Po pierwsze gdira i ida nie poprawnie to jeszcze dekompilują przez sekcje DATA w środku. Trzeba zmienić go na sekcje CODE.  Druga rzecz to zescanfować na zwykłe zmienne i zmodyfikować kod funkcji sub_30B0 podstawiając je w miejsce zmodyfikowanego kodu.
+Na przykład dla 3. scanfa:
+
+	scanf(key_part,"%x",0x1030d7);
+, gdzie 
+	0x1030d6 MOV	ECX, 0x2137
+i w sub_30B0
+	uVar1 = qword_30A8 * 0x2137 + param_1;
+
+modyfikujemy kod następująco:
+ 	sscanf(key_part, "%x", &dword_30D7);
+ i w funkcji sub_30B0
+ 	uVar1 = qword_30A8 * dword_30D7 + param_1;
+
+Późniejsza seria wywołań sub_1000 także weźmie te 3 nowe argumenty.
+Doszliśmy w ten sposób do momentu w którym można zacząć dekryptować plik.
+
+Tutaj właściwie można wprost przekopiować kod z idy. Czytamy zaszyfrowany kod pliku po 4 bajty, w zależności od trudności przepuszczamy przez odpowiednią funkcję i zapisujemy do nowego pliku.
+
+Teraz pozostaje odgadnąć hasło do pliku.
+Odzyskanie 4 pierwszych kawałków hasła jest dość łatwe ze względu na fakt, że XOR jest sam dla siebie operacją odwrotną.
+Mamy tak naprawde serie instrukcji typu (indeksy key, z wyjątkami, odpowiadają porządkowi adresów pamięci):
+	cyphered_key[0] == sub_1000(/* key[15] */ dword_32B0)
+	cyphered_key[1] == sub_1000(/* key[14] */ dword_32AC)
+	cyphered_key[2] == sub_1000(/* key[13] */ dword_30D7)
+	cyphered_key[3] == sub_1000(/* key[12] */ dword_30BD)
+	cyphered_key[4] == sub_1000(/* key[11] */ dword_32A8)
+	cyphered_key[5] == sub_1000(/* key[10] */ dword_30DC)
+	cyphered_key[6] == sub_1000(/* key[9] */ dword_32A4)
+	cyphered_key[7] == sub_1000(/* key[8] */ dword_32A0)
+gdzie w sub_1000(param1)
+	uint uVar1;
+    param_1 = param_1 ^ qword_30A0;
+    uVar1 = qword_30A8 * 0x2137 + param_1;
+    qword_30A0 = qword_30A4;
+    qword_30A4 = qword_30A8;
+    qword_30A8 = qword_30AC;
+    qword_30AC = ROR(uVar1, 6);
+    return param_1;
+czyli xor argumentu z qword_30A0 i "przekręcenie" pozostałych zmiennych.
+Wiemy więc np., że
+	/* key[12] */ dword_32B0  = cyphered_key[0] ^ qword_30A0
+	/* key[11] */ dword_32AC = cyphered_key[1] ^ qword_30A4 // bo się "przekręciło"
+	/* key[10] */ dword_30D7 = cyphered_key[2] ^ qword_30A8 // bo się dwa razy "przekręciło"
+	/* key[9]  */ dword_30BD = cyphered_key[3] ^ qword_30AC // bo się trzy razy przekręciło
+
+na tym jednak się kończy łatwe odszyfrowywanie, ponieważ przekręcenie wartości qword_30AC jest już bardziej skomplikowane - ROR(qword_30A8 * 0x2137 + param_1, 6)
+Napisałem potem funkcję odwrotną do sub_1000:
+	uint inv_sub_1000(uint param_2) {
+		uint uVar1 = ROL(qword_30AC, 6);
+		qword_30AC = qword_30A8;
+		qword_30A8 = qword_30A4;
+		qword_30A4 = qword_30A0;
+		uint param_1 = uVar1 - qword_30A8 * 0x2137;
+		qword_30A0 = param_2 ^ param_1;
+		return param_1;
+	}
+Próbowałem wywoływać ją mniej wiecej nastepująco:
+dla takiej serii:
+	b = sub_1000(a)
+	d = sub_1000(d)
+	f = sub_1000(e)
+wywoływałbym ją tak (w odwrotnej kolejności):
+	e = inv_sub_1000(f)
+	d = inv_sub_1000(d)
+	a = inv_sub_1000(b)
+Ale nie przynosiło to rezultatów. Myślę, że da się jakoś skorzystać z faktu odwacalności funkcji sub_1000 ale na ten moment nie wiem jak.
+
+Wróciłem do poprzedniego pomysłu. Zaobserwowałem, że ważniejsze jest by oszyfrować plik bez znajomości hasła, a nie wprost je odzyskiwać.
+Do deszyfrowania ważne jest by 4 zmienne - qword_30A0, qword_30A4, qword_30A8, qword_30AC, miały dobrą wartość przed jego rozpoczęciem.
+
+Poprzedni pomysł można uprościć - ciąg
+	/* key[12] */ dword_32B0  = cyphered_key[0] ^ qword_30A0
+	/* key[11] */ dword_32AC = cyphered_key[1] ^ qword_30A4
+	/* key[10] */ dword_30D7 = cyphered_key[2] ^ qword_30A8
+	/* key[9]  */ dword_30BD = cyphered_key[3] ^ qword_30AC
+można tak napradę zamienić na
+	/* key[12] */ dword_32B0  = cyphered_key[0] ^ qword_30A0
+	// "przekręcenie" zmiennych
+
+	/* key[11] */ dword_32AC = cyphered_key[1] ^ qword_30A0
+	// "przekręcenie" zmiennych
+
+	/* key[10] */ dword_30D7 = cyphered_key[2] ^ qword_30A0
+	// "przekręcenie" zmiennych
+
+	/* key[9]  */ dword_30BD = cyphered_key[3] ^ qword_30A0
+
+czyli zawsze xorowanie z qword_30A0
+
+"przekręcenie" to znaczy tak naprawde wywołanie funkcji sub_1000  z odpowiednim argumentem. Jak znaleźć ten argument?
+
+Jeśli użytkownik podaje nam hasło to wywołujemy funkcje
+	sub_1000((key[12])
+No to teraz możemy wywołac
+	sub_1000(key[12] = cyphered_key[0] ^ qword_30A0)
+i właśnie wywołaliśmy tak samo pierwszą funkcje sub_1000 mimo braku znajomości hasła.
+
+To przekręcanie ma też drugą zaletę - nie musimy przejmować się skomplikowanym przekręcaniem wartości qword_30AC ( ROR(qword_30A8 * 0x2137 + param_1, 6) ).
+Dzieje się to samo jeśli po prostu odpalimy funkcję sub_1000!
+
+Czyli poprzedni problem - nie wiadomo z czym zxorować kolejne cyphered_key[i]
+	/* key[12] */ dword_32B0  = cyphered_key[0] ^ qword_30A0
+	/* key[11] */ dword_32AC = cyphered_key[1] ^ qword_30A4
+	/* key[10] */ dword_30D7 = cyphered_key[2] ^ qword_30A8
+	/* key[9]  */ dword_30BD = cyphered_key[3] ^ qword_30AC
+	/* key[8]  */ dword_32A8 = cyphered_key[4] ^ ???
+
+rozwiązuje się, bo KAŻDĄ część xorujemy z qword_30A0, wywołując pomiędzy tym funkcje sub_1000 z argumentem otrzymanym w poprzedniej linijce:
+
+	dword_32B0 =  cyphered_key[0] ^ qword_30A0;
+    dword_3280 = sub_1000(dword_32B0);
+
+    dword_32AC = cyphered_key[1] ^ qword_30A0;
+    dword_3284 = sub_1000(dword_32AC);
+
+    dword_30D7 =  cyphered_key[2] ^ qword_30A0;
+    dword_3288 = sub_1000(dword_30D7);
+
+    dword_30BD =  cyphered_key[3] ^ qword_30A0;
+    dword_328C = sub_1000(dword_30BD);
+
+    dword_32A8 = cyphered_key[4] ^ qword_30A0;
+    dword_3290 = sub_1000(dword_32A8);
+
+    dword_30DC = cyphered_key[5] ^ qword_30A0;
+    dword_3294 = sub_1000(dword_30DC);
+
+    dword_32A4 = cyphered_key[6] ^ qword_30A0;
+    dword_3298 = sub_1000(dword_32A4);
+
+    dword_32A0 = cyphered_key[7] ^ qword_30A0;
+    dword_329C = sub_1000(dword_32A0);
+
+I taki kod pozwala nam odkodować plik bez podanego przez użytkownika hasła.
+Moja binarka działa jak oryginalna kiedy się poda hasło i działa jak powinna jeśli się go nie poda.
+
+Wiem, że nazwy zmiennych mogą być nienajczytelniejsze, ale kopiowałem jest bezpośrednio z Idy by zachowac choć minimalną spójność - otwarty mój kod, Ida i Ghidra, w KAŻDYM inne nazwy zmiennych to by było za dużo.

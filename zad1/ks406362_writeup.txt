@@ -1,0 +1,14 @@
+1. Pierwszą rzeczą jaką zrobiłem było wykorzystanie narzędzia dirsearch. Pokazał on m.in., że istnieje podstrona '/admin_panel' co potwierdziło moje przypuszczenia, że flaga będzie dostępna dla administratora i trzeba wykonać jakąś akcje z jego uprawnieniami.
+2. Pierwszym pomysłem było umieszczenie tagów HTML-owych w tytule wątku - niestety okazało się, że nie są one wykonywane.
+Druga opcja to umieszczenie ich w poście. Gdy podejrzy się zawartość 'content=...' w requescie POST wysłanym by zamieścić post w wątku to okazuje się, że wszystkie komentarze wysyłane są ze znacznikami <p> i poźniej w wątku także widoczne są jako elementy <p>.
+Znaczy to, że jeśli uda się zamieścić tagi HTML, w szczególności '<script>...</script>', w treści posta to zostaną one umieszczone w DOM.
+3. Ograniczenie długości znaków jest weryfikowane po stronie serwera - nawet jeśli usunie się atrybut maxlength z pola do wpisywania posta, to nasz dłuższy post nie zostanie dodany do wątku.
+Oznacza to, że długośc posta równa 13 musi nam wystarczyć. W 13 znakach nie jesteśmy w stanie przeprowadzić CTF-u, więc należy w jakiś sposób połaczyć posty.
+Sposobem na to są js-owe komentarze. Wysłanie posta o treści '<script>/*' i drugiego o treści '*/</script>' wykomentowuję elemeny DOM obecne pomiędzy dwoma postami widocznymi na stronie.
+Znaczy to, że możemy wykonywać kod posklejany z kawałków długości 13-len('/*' + '*/')=9. Jedynym ograniczenie jest to, że pojedyńcze słowa w kodzie nie mogą być przecięte komentarzem w js - 'loca/**/tion.window' nie zadziała, ale 'location/**/.window' już tak.
+4. Próbując grzebać po forum takim sposobem miałem problemy z poprawnym dzieleniem i łączeniem stringów (nadmiar ', " i + może być dezorinetujący).
+Dużo czasu spędziłem myśląć, że '/admin_panel' to konkretny zasób, próbująć wejść na niego i przesłać jego zawartość na requestbin. Dodatkową trudnością było pobraniego go, ponieważ nie robiłem tego 'window.location=' tylko korzystając z fetchAPI z konstrukcją await, a później (po zorientowaniu się, że await nie działa w <script> bez atrybutu async) z konstrukcją '.then(...)'.
+Kiedy uznałem, że właściwie nie szkodzi podejrzeć samej strony wątku z pozycji administratora napotkałem następujacy problem - klucz 'documentElement' zmiennej 'document' był za długi i nie dało się go przedzielić komentarzem.
+Zrezygnowany uznałem, że wyśle zawartość tylko <body> nie licząć na zbyt wiele. Zakodowałem je w base64 (dokładnie btoa(unescape(encodeURI(...))) ) i wysłałem. Na requestbinie okazało się, że po odkodowaniu (atob(...)) flaga (FLAG{2bb0e8357ffff1596a8a2970ab8dbb192bee0dd6}) dostępna jest po prostu jako drugi element <body>.
+
+W rozwiązaniu zadania pomógł mi kanał LiveOverflow (https://www.youtube.com/channel/UClcE-kVhqyiHCcjYwcpfj9w), post na portswigger (https://portswigger.net/support/xss-filters-beating-length-limits-using-spanned-payloads) i konwerter curli do kody pythona (https://curl.trillworks.com/).
